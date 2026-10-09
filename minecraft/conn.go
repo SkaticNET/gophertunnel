@@ -193,11 +193,16 @@ type Conn struct {
 
 	// packetFunc is an optional function passed to a Dial() call. If set, each packet read from and written
 	// to this connection will call this function.
-	packetFunc func(header packet.Header, payload []byte, src, dst net.Addr)
+	packetFunc            func(header packet.Header, payload []byte, src, dst net.Addr)
+	packetObserver        PacketObserver
+	inboundPacketOrdinal  atomic.Uint64
+	outboundPacketOrdinal atomic.Uint64
+	lastPacketMetadataMu  sync.RWMutex
+	lastPacketMetadata    PacketMetadata
 
 	shieldID atomic.Int32
 
-	additional chan packet.Packet
+	additional chan queuedPacket
 }
 
 // newConn creates a new Minecraft connection for the net.Conn passed, reading and writing compressed
@@ -210,7 +215,7 @@ func newConn(netConn net.Conn, key *ecdsa.PrivateKey, log *slog.Logger, proto Pr
 		dec:          packet.NewDecoder(netConn),
 		salt:         make([]byte, 16),
 		packets:      make(chan *packetData, 8),
-		additional:   make(chan packet.Packet, 16),
+		additional:   make(chan queuedPacket, 16),
 		spawn:        make(chan struct{}),
 		conn:         netConn,
 		privateKey:   key,
@@ -408,6 +413,17 @@ func (conn *Conn) WritePacket(pk packet.Packet) error {
 			conn.packetFunc(*conn.hdr, buf.Bytes()[l:], conn.LocalAddr(), conn.RemoteAddr())
 		}
 		conn.bufferedSend = append(conn.bufferedSend, append([]byte(nil), buf.Bytes()...))
+		local, remote := conn.packetAddresses()
+		conn.observePacket(PacketObservation{
+			Direction:  PacketDirectionOutbound,
+			Ordinal:    conn.outboundPacketOrdinal.Add(1),
+			LocalAddr:  local,
+			RemoteAddr: remote,
+			Header:     *conn.hdr,
+			Payload:    buf.Bytes()[l:],
+			Packet:     converted,
+			Stage:      PacketObservationEncodedQueued,
+		})
 	}
 	return nil
 }
@@ -420,7 +436,9 @@ func (conn *Conn) WritePacket(pk packet.Packet) error {
 // packet read.
 func (conn *Conn) ReadPacket() (pk packet.Packet, err error) {
 	if len(conn.additional) > 0 {
-		return <-conn.additional, nil
+		queued := <-conn.additional
+		conn.setLastPacketMetadata(queued.metadata)
+		return queued.packet, nil
 	}
 	if data, ok := conn.takeDeferredPacket(); ok {
 		pk, err := data.decode(conn)
@@ -431,9 +449,10 @@ func (conn *Conn) ReadPacket() (pk packet.Packet, err error) {
 		if len(pk) == 0 {
 			return conn.ReadPacket()
 		}
-		for _, additional := range pk[1:] {
-			conn.additional <- additional
+		for i, additional := range pk[1:] {
+			conn.additional <- queuedPacket{packet: additional, metadata: data.metadata(uint32(i + 1))}
 		}
+		conn.setLastPacketMetadata(data.metadata(0))
 		return pk[0], nil
 	}
 
@@ -451,11 +470,26 @@ func (conn *Conn) ReadPacket() (pk packet.Packet, err error) {
 		if len(pk) == 0 {
 			return conn.ReadPacket()
 		}
-		for _, additional := range pk[1:] {
-			conn.additional <- additional
+		for i, additional := range pk[1:] {
+			conn.additional <- queuedPacket{packet: additional, metadata: data.metadata(uint32(i + 1))}
 		}
+		conn.setLastPacketMetadata(data.metadata(0))
 		return pk[0], nil
 	}
+}
+
+// LastPacketMetadata returns the sequence metadata for the packet most recently
+// returned by ReadPacket.
+func (conn *Conn) LastPacketMetadata() PacketMetadata {
+	conn.lastPacketMetadataMu.RLock()
+	defer conn.lastPacketMetadataMu.RUnlock()
+	return conn.lastPacketMetadata
+}
+
+func (conn *Conn) setLastPacketMetadata(metadata PacketMetadata) {
+	conn.lastPacketMetadataMu.Lock()
+	conn.lastPacketMetadata = metadata
+	conn.lastPacketMetadataMu.Unlock()
 }
 
 // ResourcePacks returns a slice of all resource packs the connection holds. For a Conn obtained using a
@@ -463,6 +497,20 @@ func (conn *Conn) ReadPacket() (pk packet.Packet, err error) {
 // packs include all packs sent by the server connected to.
 func (conn *Conn) ResourcePacks() []*resource.Pack {
 	return conn.resourcePacks
+}
+
+func (conn *Conn) observePacket(observation PacketObservation) {
+	defer func() { _ = recover() }()
+	if observer := conn.packetObserver; observer != nil {
+		observer(observation)
+	}
+}
+
+func (conn *Conn) packetAddresses() (net.Addr, net.Addr) {
+	if conn.conn == nil {
+		return nil, nil
+	}
+	return conn.LocalAddr(), conn.RemoteAddr()
 }
 
 // Write writes a slice of serialised packet data to the Conn. The data is buffered until the next 20th of a

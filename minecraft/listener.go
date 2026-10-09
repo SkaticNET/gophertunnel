@@ -113,6 +113,10 @@ type ListenConfig struct {
 	// from which the packet originated, and the destination address.
 	PacketFunc func(header packet.Header, payload []byte, src, dst net.Addr)
 
+	// PacketObserver optionally receives raw packet bytes and their decode result.
+	// The callback runs synchronously on the connection read or write path.
+	PacketObserver PacketObserver
+
 	// MaxDecompressedLen is the maximum length of a decompressed packet to prevent potential exploits. If 0,
 	// the default value is 16MB (16 * 1024 * 1024). Setting this to a negative integer disables the limit.
 	MaxDecompressedLen int
@@ -428,6 +432,7 @@ func (listener *Listener) createConn(netConn net.Conn) {
 	conn.allow = listener.cfg.Allow
 
 	conn.packetFunc = listener.cfg.PacketFunc
+	conn.packetObserver = listener.cfg.PacketObserver
 	conn.texturePacksRequired = listener.cfg.TexturePacksRequired
 	conn.forceDisableVibrantVisuals = listener.cfg.ForceDisableVibrantVisuals
 	conn.resourcePacks = packs
